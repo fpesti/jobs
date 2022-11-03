@@ -84,6 +84,14 @@
                   counters = [],
                   regulators = []}).
 
+-record(measurements, {
+        logtimestamp = 0, 
+	ask_call_counter = [],
+	timer_starts = 0,
+	timer_msgs = 0 }).
+
+-define(LOGINTERVAL, 1000000).
+
 -define(SERVER, ?MODULE).
 
 -ifdef(OTP_RELEASE).
@@ -652,6 +660,7 @@ handle_call(Req, From, S) ->
 i_handle_call({ask, Type}, From, #st{queues = Qs} = S) ->
     TS = timestamp(),
     {Qname, S1} = select_queue(Type, TS, S),
+    count_ask_calls(Qname),
     case get_queue(Qname, Qs) of
         #queue{type = #action{a = approve}, stateful = undefined,
 	       approved = Approved} = Q ->
@@ -918,6 +927,7 @@ handle_info({revisit_queue, Name}, #st{queues = Qs} = S) ->
             {noreply, S}
     end;
 handle_info({check_queue, Name}, #st{queues = Qs} = S) ->
+    update_timer_msgs(),    
     case get_queue(Name, Qs) of
         #queue{} = Q ->
             TS = timestamp(),
@@ -1472,6 +1482,8 @@ calc_timeout(#queue{oldest_job = OJ, max_time = MaxT}) when is_integer(MaxT) ->
 
 new_timer(T, #queue{name = Name} = Q) ->
     Msg = {check_queue, Name},
+    M = update_timer_starts(),
+    log_measurements_info(M),
     TRef = do_send_after(T, Msg),
     Q#queue{timer = TRef}.
 
@@ -1874,3 +1886,109 @@ replay(true, S) ->
     after
         ets:delete(?MODULE, {replay, true})
     end.
+
+maybe_queue_link_DOWN(Ref, #st{queues = Qs} = S) ->
+    case lists:keyfind(Ref, #queue.link_ref, Qs) of
+        #queue{name = Name} ->
+            error_logger:info_report([{jobs, removing_queue},
+                                      {name, Name},
+                                      {reason, linked}]),
+            S#st{queues = lists:keydelete(Ref, #queue.link_ref, Qs)};
+        false ->
+            S
+    end.
+
+update_timer_msgs()->
+   case get(measurements) of 
+	undefined-> 
+            NewM = #measurements{logtimestamp = erlang:timestamp(), timer_msgs = 1},
+	    put(measurements, NewM),
+	    NewM;
+	#measurements{timer_msgs = TimerMsgs}=M->
+            NewM = M#measurements{timer_msgs = TimerMsgs +1},
+	    put(measurements, NewM),
+	    NewM
+   end.
+update_timer_starts()->
+   case get(measurements) of 
+	undefined-> 
+            NewM = #measurements{logtimestamp = erlang:timestamp(), timer_starts = 1},
+	    put(measurements, NewM),
+	    NewM;
+	#measurements{timer_starts = TimerCalls}=M->
+            NewM = M#measurements{timer_starts = TimerCalls +1},
+	    put(measurements, NewM),
+	    NewM
+   end.
+
+log_measurements_info(#measurements{logtimestamp = Start}=Measurements)->
+   case check_log_interval(Start) of
+      true ->
+	print_info(Measurements),
+	put(measurements, Measurements#measurements{logtimestamp = erlang:timestamp(), ask_call_counter = [], timer_starts =0, timer_msgs = 0});
+      _->
+	ok
+   end.
+
+check_log_interval(Start)->
+   Now = erlang:timestamp(),
+   Diff = timer:now_diff(Now, Start),
+   %io:format(standard_error, "Diff:~p~n", [Diff]),
+   Diff > ?LOGINTERVAL.
+
+print_info(#measurements{ask_call_counter = AskCallCounter, timer_starts = TimerStarts, timer_msgs = TimerMsgs})->
+   Time= os:system_time(1000),
+   print_log("-----------------------------------------------------~n", []),
+   print_log("Measurements info at: ~p~n", [calendar:system_time_to_universal_time(Time, 1000)]), 
+   print_log("Ask calls in last second: ~p ~n", [AskCallCounter]), 
+   print_log("Timer starts in last second: ~p ~n", [TimerStarts]), 
+   print_log("Incoming timer messages in last interval: ~p ~n", [TimerMsgs]), 
+
+   [{message_queue_len, Size}] = erlang:process_info(self(),[message_queue_len]),
+   if Size < 1000 andalso Size > 0->
+      [{messages, Msgs}] = erlang:process_info(self(),[messages]),
+      SortedMsgs = sort_messages(Msgs),
+      print_log("Messages: ~p~n", [maps:to_list(SortedMsgs)]);
+      true->
+	print_log("Message queue size ~p~n", [Size]),      
+	ok
+   end,
+   print_log("-----------------------------------------------------~n", []).
+
+
+
+sort_messages(Msgs)->
+%[{'$gen_call',{<0.18353.0>,#Ref<0.722578450.3387949059.125468>}, {ask,create}}]
+	lists:foldl(fun({'$gen_call',_,{ask,Queue}}, Acc)-> maps:update_with({ask, Queue}, fun(Num)-> Num + 1 end, 1, Acc);		    
+                       ({'$gen_cast', {done, _,_}}, Acc)->maps:update_with(done, fun(Num)->Num+1 end, 1,Acc); 
+                       ({'DOWN', _,_,_,_}, Acc)->maps:update_with('DOWN', fun(Num)->Num+1 end, 1,Acc);
+		      (Item, Acc)-> maps:update_with(Item, fun(Num)-> Num + 1 end, 1, Acc)
+		 end, #{}, Msgs). 
+%lists:foldl(fun({'$gen_call', _, {ask, Queue}}, Acc)->maps:update_with({ask,Queue}, fun(Num)->Num+1 end, 1,Acc); 
+%               ({'$gen_cast', {done, _,_}}, Acc)->maps:update_with(done, fun(Num)->Num+1 end, 1,Acc); 
+%               ({'DOWN', _,_,_,_}, Acc)->maps:update_with('DOWN', fun(Num)->Num+1 end, 1,Acc);
+%               (Item, Acc)->maps:update_with(Item, fun(Num)->Num+2 end, 1,Acc) end, #{},Msgs2).
+
+count_ask_calls(Qname)->
+   case get(measurements) of 
+	undefined-> 
+            put(measurements, #measurements{logtimestamp = erlang:timestamp(), ask_call_counter = [{Qname, 1}], timer_starts = 0, timer_msgs = 0});
+	#measurements{ask_call_counter = AskCallCounter}=M->
+	   NewM = case lists:keyfind(Qname, 1, AskCallCounter) of
+               false->
+	         NewAskCallCounter = [{Qname, 1} | AskCallCounter],            
+                 Measurements = M#measurements{ask_call_counter = NewAskCallCounter},
+		 %put(measurements, Measurements),
+		 Measurements;
+
+		 {_, Counter}->
+	         NewAskCallCounter = lists:keyreplace(Qname, 1, AskCallCounter, {Qname, Counter + 1}),            
+                 Measurements = M#measurements{ask_call_counter = NewAskCallCounter},
+		 %put(measurements, Measurements),
+		 Measurements
+	   end,
+	   put(measurements, NewM),
+	   log_measurements_info(NewM)
+   end.
+print_log(Log, Args)->
+	io:format(standard_error, Log, Args).
