@@ -923,7 +923,9 @@ handle_info({check_queue, Name}, #st{queues = Qs} = S) ->
             TS = timestamp(),
             {Q1, QC, S1} = perform_queue_check(
                              Q#queue{timer = undefined}, TS, S),
-            {noreply, update_queue(Q1, QC, S1)};
+            %% the timer ref shouldn't be overriden here, because it will make start_timer function create a new one
+	    %% which causes timer message flood in the messagebox of this process
+	    {noreply, update_queue(Q1#queue{ timer = Q#queue.timer}, QC, S1)};
         _ ->
             {noreply, S}
     end;
